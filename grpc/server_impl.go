@@ -10,10 +10,11 @@ package grpc
 import (
 	"context"
 
-	"github.com/facebookincubator/prometheus-edge-hub/hub"
+	"github.com/blockcast/prometheus-edge-hub/hub"
 )
 
 type MetricsControllerServerImpl struct {
+	UnimplementedMetricsControllerServer
 	MetricHub *hub.MetricHub
 }
 

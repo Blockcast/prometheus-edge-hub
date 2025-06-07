@@ -10,13 +10,14 @@ package main
 import (
 	"flag"
 	"fmt"
-	"google.golang.org/grpc"
 	"log"
 	"net"
 	"net/http"
 
-	hubgrpc "github.com/facebookincubator/prometheus-edge-hub/grpc"
-	"github.com/facebookincubator/prometheus-edge-hub/hub"
+	"google.golang.org/grpc"
+
+	hubgrpc "github.com/blockcast/prometheus-edge-hub/grpc"
+	"github.com/blockcast/prometheus-edge-hub/hub"
 	"github.com/labstack/echo"
 )
 

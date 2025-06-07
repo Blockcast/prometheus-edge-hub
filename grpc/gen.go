@@ -5,5 +5,5 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//go:generate bash -c "protoc --proto_path=. --go_out=plugins=grpc:. service.proto"
+//go:generate protoc --proto_path=. --go_out=. --go-grpc_out=. --go_opt=paths=source_relative --go-grpc_opt=paths=source_relative --go_opt=Mservice.proto=./grpc --go-grpc_opt=Mservice.proto=./grpc service.proto
 package grpc
