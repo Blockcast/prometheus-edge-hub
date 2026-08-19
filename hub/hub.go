@@ -181,8 +181,6 @@ func (c *MetricHub) ReceiveGRPC(families []*dto.MetricFamily) {
 	}
 
 	grpcReceiveTime.Set(time.Since(t0).Seconds())
-	log.Printf("GRPC Time: %v\n", time.Since(t0))
-	log.Printf("GRPC Time(seconds): %f\n", time.Since(t0).Seconds())
 	grpcReceiveSizeFam.Set(float64(len(families)))
 	grpcReceiveSizeDP.Set(float64(newDatapoints))
 
