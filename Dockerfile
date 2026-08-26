@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-FROM golang:1.24.4-alpine3.21 as go
+FROM golang:1.25-alpine3.21 as go
 
 # Use public go modules proxy
 ENV GOPROXY https://proxy.golang.org
