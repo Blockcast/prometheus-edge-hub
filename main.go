@@ -18,7 +18,7 @@ import (
 
 	hubgrpc "github.com/blockcast/prometheus-edge-hub/grpc"
 	"github.com/blockcast/prometheus-edge-hub/hub"
-	"github.com/labstack/echo"
+	"github.com/labstack/echo/v4"
 )
 
 const (
