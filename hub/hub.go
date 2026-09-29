@@ -28,6 +28,10 @@ import (
 
 const (
 	scrapeWorkerPoolSize = 100
+
+	// ScraperQueryParam names the scraper on GET /metrics when the hub keeps
+	// one buffer per scraper (see NewPerScraperMetricHub).
+	ScraperQueryParam = "scraper"
 )
 
 var (
@@ -42,11 +46,21 @@ var (
 	grpcReceiveTime    = prometheus.NewGauge(prometheus.GaugeOpts{Name: "grpc_receive_time", Help: "Time to ingest last GRPC receive"})
 
 	scrapeLockWait = prometheus.NewGauge(prometheus.GaugeOpts{Name: "scrape_lock_wait", Help: "Time spent waiting on lock by last scrape request"})
+
+	scraperDatapoints = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "hub_scraper_datapoints",
+		Help: "Datapoints waiting for one scraper in per-scraper mode",
+	}, []string{"scraper"})
+	scraperRejectedDatapoints = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "hub_scraper_rejected_datapoints_total",
+		Help: "Datapoints not retained for one scraper in per-scraper mode because its buffer was at the hub limit",
+	}, []string{"scraper"})
 )
 
 func init() {
 	prometheus.MustRegister(hubLimit, hubSize, httpReceiveSizeFam, httpReceiveSizeDP, httpReceiveTime, parseTime,
-		grpcReceiveTime, grpcReceiveSizeDP, grpcReceiveSizeFam, scrapeLockWait)
+		grpcReceiveTime, grpcReceiveSizeDP, grpcReceiveSizeFam, scrapeLockWait,
+		scraperDatapoints, scraperRejectedDatapoints)
 }
 
 // MetricHub serves as a replacement for the prometheus pushgateway. Accepts
@@ -54,10 +68,23 @@ func init() {
 // datapoints per metric series to be scraped
 type MetricHub struct {
 	metricFamiliesByName map[string]*familyAndMetrics
-	limit                int
-	stats                hubStats
+	// perScraper is non-nil only for a hub built by NewPerScraperMetricHub.
+	// It then replaces metricFamiliesByName: every push is retained once per
+	// configured scraper, and a scrape drains only the requesting scraper's
+	// buffer.
+	perScraper map[string]*scraperBuffer
+	limit      int
+	stats      hubStats
 	sync.Mutex
 	scrapeTimeout int
+}
+
+// scraperBuffer holds the datapoints one scraper has not drained yet. The
+// *dto.Metric values are shared by every buffer that accepted them and are
+// never written after insertion, so buffers cost pointers, not copies.
+type scraperBuffer struct {
+	metricFamiliesByName map[string]*familyAndMetrics
+	datapoints           int
 }
 
 // hubStats are for metrics that aren't worth exposing to prometheus, and also
@@ -97,6 +124,87 @@ func NewMetricHub(limit int, scrapeTimeout int) *MetricHub {
 	}
 }
 
+// NewPerScraperMetricHub creates a hub that delivers every datapoint to each
+// of the named scrapers exactly once.
+//
+// The single-buffer hub drains everything to whichever scraper calls first.
+// That is correct for one Prometheus and wrong for a replicated one: N
+// replicas scraping one hub each receive a disjoint ~1/N of every push, so
+// no replica holds the full series and a query answered by one replica can
+// be arbitrarily stale. Here each scraper names itself with
+// ?scraper=<id> and drains only its own buffer.
+//
+// limit bounds each buffer independently. A buffer at the limit drops the
+// push for that scraper only, counted in
+// hub_scraper_rejected_datapoints_total, so one stalled replica cannot stop
+// ingestion for the others. A push is refused outright only when no buffer
+// can take it.
+func NewPerScraperMetricHub(limit int, scrapeTimeout int, scrapers []string) (*MetricHub, error) {
+	if len(scrapers) == 0 {
+		return nil, fmt.Errorf("per-scraper hub needs at least one scraper id")
+	}
+	buffers := make(map[string]*scraperBuffer, len(scrapers))
+	for _, id := range scrapers {
+		if id == "" {
+			return nil, fmt.Errorf("scraper ids must be non-empty: %q", scrapers)
+		}
+		if _, dup := buffers[id]; dup {
+			return nil, fmt.Errorf("scraper id %q is listed more than once", id)
+		}
+		buffers[id] = &scraperBuffer{metricFamiliesByName: make(map[string]*familyAndMetrics)}
+		scraperDatapoints.WithLabelValues(id).Set(0)
+		scraperRejectedDatapoints.WithLabelValues(id).Add(0)
+	}
+	hub := NewMetricHub(limit, scrapeTimeout)
+	hub.perScraper = buffers
+	glog.Infof("Prometheus-Edge-Hub draining per scraper: %q\n", scrapers)
+	return hub, nil
+}
+
+// receivePerScraper retains families in every scraper buffer with room for
+// them and returns how many buffers accepted the push.
+func (c *MetricHub) receivePerScraper(families []*dto.MetricFamily, newDatapoints int) int {
+	// makeLabeledName sorts a metric's labels in place, and the same metric
+	// is shared by every buffer, so name each datapoint once, up front.
+	names := make([][]string, len(families))
+	for i, fam := range families {
+		names[i] = make([]string, len(fam.Metric))
+		for j, metric := range fam.Metric {
+			names[i][j] = makeLabeledName(metric, fam.GetName())
+		}
+	}
+
+	accepted := 0
+	largest := 0
+	for id, buffer := range c.perScraper {
+		if c.limit > 0 && buffer.datapoints+newDatapoints > c.limit {
+			glog.Errorf("Not retaining push of size %d for scraper %q: would overfill hub limit of %d. Its buffer holds %d.\n",
+				newDatapoints, id, c.limit, buffer.datapoints)
+			scraperRejectedDatapoints.WithLabelValues(id).Add(float64(newDatapoints))
+		} else {
+			for i, fam := range families {
+				stored, ok := buffer.metricFamiliesByName[fam.GetName()]
+				if !ok {
+					stored = &familyAndMetrics{family: familyHeader(fam), metrics: make(map[string][]*dto.Metric)}
+					buffer.metricFamiliesByName[fam.GetName()] = stored
+				}
+				stored.insertNamed(names[i], fam.Metric)
+			}
+			buffer.datapoints += newDatapoints
+			scraperDatapoints.WithLabelValues(id).Set(float64(buffer.datapoints))
+			accepted++
+		}
+		if buffer.datapoints > largest {
+			largest = buffer.datapoints
+		}
+	}
+	// hub_size is compared against hub_limit, and here the limit applies per
+	// buffer, so report the fullest one.
+	c.stats.currentCountDatapoints = largest
+	hubSize.Set(float64(largest))
+	return accepted
+}
+
 // Receive is a handler function to receive metric pushes
 func (c *MetricHub) Receive(ctx echo.Context) error {
 	t0 := time.Now()
@@ -114,6 +222,27 @@ func (c *MetricHub) Receive(ctx echo.Context) error {
 	newDatapoints := 0
 	for _, fam := range parsedFamilies {
 		newDatapoints += len(fam.Metric)
+	}
+
+	if c.perScraper != nil {
+		families := make([]*dto.MetricFamily, 0, len(parsedFamilies))
+		for _, fam := range parsedFamilies {
+			families = append(families, fam)
+		}
+		c.Lock()
+		accepted := c.receivePerScraper(families, newDatapoints)
+		c.stats.lastHTTPReceiveTime = time.Now().Unix()
+		c.stats.lastHTTPReceiveSize = ctx.Request().ContentLength
+		c.stats.lastHTTPReceiveNumFamilies = len(parsedFamilies)
+		c.Unlock()
+		httpReceiveSizeDP.Set(float64(newDatapoints))
+		httpReceiveSizeFam.Set(float64(len(parsedFamilies)))
+		httpReceiveTime.Set(time.Since(t0).Seconds())
+		if accepted == 0 {
+			errString := fmt.Sprintf("Not accepting push of size %d. Every scraper buffer would overfill hub limit of %d.\n", newDatapoints, c.limit)
+			return ctx.String(http.StatusNotAcceptable, errString)
+		}
+		return ctx.NoContent(http.StatusOK)
 	}
 
 	// Check if new datapoints will exceed the specified limit
@@ -163,6 +292,19 @@ func (c *MetricHub) ReceiveGRPC(families []*dto.MetricFamily) {
 		newDatapoints += len(fam.Metric)
 	}
 
+	if c.perScraper != nil {
+		if c.receivePerScraper(families, newDatapoints) == 0 {
+			return
+		}
+		grpcReceiveTime.Set(time.Since(t0).Seconds())
+		grpcReceiveSizeFam.Set(float64(len(families)))
+		grpcReceiveSizeDP.Set(float64(newDatapoints))
+		c.stats.lastGRPCReceiveTime = time.Now().Unix()
+		c.stats.lastGRPCReceiveNumFamilies = len(families)
+		c.stats.lastGRPCReceiveSize = binary.Size(families)
+		return
+	}
+
 	// Check if new datapoints will exceed the specified limit
 	if c.limit > 0 {
 		if c.stats.currentCountDatapoints+newDatapoints > c.limit {
@@ -194,6 +336,17 @@ func (c *MetricHub) ReceiveGRPC(families []*dto.MetricFamily) {
 // Scrape is a handler function for prometheus scrape requests. Formats the
 // metrics for scraping.
 func (c *MetricHub) Scrape(ctx echo.Context) error {
+	scraper := ctx.QueryParam(ScraperQueryParam)
+	if c.perScraper != nil {
+		return c.scrapePerScraper(ctx, scraper)
+	}
+	if scraper != "" {
+		// A scraper that names itself expects its own buffer. Draining the
+		// shared one would silently take data from every other scraper, so
+		// refuse and let the scrape error show the misconfiguration.
+		return ctx.String(http.StatusBadRequest,
+			fmt.Sprintf("%s=%q given, but this hub keeps a single shared buffer; start it with -scrapers to drain per scraper\n", ScraperQueryParam, scraper))
+	}
 	c.Lock()
 	scrapeMetrics := c.metricFamiliesByName
 	c.clearMetrics()
@@ -206,6 +359,39 @@ func (c *MetricHub) Scrape(ctx echo.Context) error {
 	c.stats.lastScrapeNumFamilies = len(scrapeMetrics)
 	c.stats.currentCountDatapoints = 0
 	hubSize.Set(0)
+
+	return ctx.String(http.StatusOK, expositionString)
+}
+
+func (c *MetricHub) scrapePerScraper(ctx echo.Context, scraper string) error {
+	c.Lock()
+	buffer, ok := c.perScraper[scraper]
+	if !ok {
+		c.Unlock()
+		return ctx.String(http.StatusBadRequest,
+			fmt.Sprintf("%s=%q is not a configured scraper; this hub drains per scraper and requires one of its -scrapers ids\n", ScraperQueryParam, scraper))
+	}
+	scrapeMetrics := buffer.metricFamiliesByName
+	buffer.metricFamiliesByName = make(map[string]*familyAndMetrics)
+	buffer.datapoints = 0
+	largest := 0
+	for _, other := range c.perScraper {
+		if other.datapoints > largest {
+			largest = other.datapoints
+		}
+	}
+	c.stats.currentCountDatapoints = largest
+	c.Unlock()
+	scraperDatapoints.WithLabelValues(scraper).Set(0)
+	hubSize.Set(float64(largest))
+
+	expositionString := c.exposeMetrics(scrapeMetrics, scrapeWorkerPoolSize)
+
+	c.Lock()
+	c.stats.lastScrapeTime = time.Now().Unix()
+	c.stats.lastScrapeSize = int64(len(expositionString))
+	c.stats.lastScrapeNumFamilies = len(scrapeMetrics)
+	c.Unlock()
 
 	return ctx.String(http.StatusOK, expositionString)
 }
@@ -306,7 +492,22 @@ Current Count Datapoints: %d `, hostname, limitValue, utilizationValue,
 		c.stats.lastGRPCReceiveTime, c.stats.lastGRPCReceiveSize, c.stats.lastGRPCReceiveNumFamilies,
 		c.stats.currentCountFamilies, c.stats.currentCountSeries, c.stats.currentCountDatapoints)
 
-	if verbose != "" {
+	if c.perScraper != nil {
+		c.Lock()
+		ids := make([]string, 0, len(c.perScraper))
+		for id := range c.perScraper {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		debugString += "\n\nPer-scraper buffers:"
+		for _, id := range ids {
+			debugString += fmt.Sprintf("\n\t%s: %d datapoints", id, c.perScraper[id].datapoints)
+		}
+		c.Unlock()
+		if verbose != "" {
+			debugString += "\n\nVerbose exposition is not available in per-scraper mode; scrape /metrics?scraper=<id> instead.\n"
+		}
+	} else if verbose != "" {
 		debugString += fmt.Sprintf("\n\nCurrent Exposition Text:\n%s\n", c.exposeMetrics(c.metricFamiliesByName, scrapeWorkerPoolSize))
 	}
 
@@ -372,22 +573,56 @@ func (f *familyAndMetrics) addMetrics(newMetrics []*dto.Metric) {
 	}
 }
 
+// insertNamed adds metrics whose labeled names were computed by the caller,
+// keeping each series queue sorted by timestamp.
+func (f *familyAndMetrics) insertNamed(names []string, newMetrics []*dto.Metric) {
+	for i, metric := range newMetrics {
+		name := names[i]
+		if queue, ok := f.metrics[name]; ok {
+			if *metric.TimestampMs >= *queue[len(queue)-1].TimestampMs {
+				f.metrics[name] = append(queue, metric)
+			} else {
+				f.metrics[name] = sortedInsert(queue, metric)
+			}
+		} else {
+			f.metrics[name] = []*dto.Metric{metric}
+		}
+	}
+}
+
+// familyHeader returns a family's name, help, type and unit without its
+// metrics, so a buffer can own its header while sharing the datapoints.
+func familyHeader(family *dto.MetricFamily) *dto.MetricFamily {
+	return &dto.MetricFamily{
+		Name: family.Name,
+		Help: family.Help,
+		Type: family.Type,
+		Unit: family.Unit,
+	}
+}
+
 // Returns a prometheus MetricFamily populated with all datapoints, sorted so
 // that the earliest datapoint appears first
 func (f *familyAndMetrics) popDatapoints() *dto.MetricFamily {
-	pullFamily := f.copyFamily()
-	for _, queue := range f.metrics {
+	// A fresh header rather than a value copy of f.family: a generated
+	// message embeds protoimpl.MessageState, which must not be copied.
+	pullFamily := familyHeader(f.family)
+	// Series in name order, so a scrape's exposition does not depend on map
+	// iteration order: every scraper of a per-scraper hub reads the same
+	// text, and TestReceiveGRPCMultipleMetricsSameFamily stops flaking.
+	names := make([]string, 0, len(f.metrics))
+	for name := range f.metrics {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		queue := f.metrics[name]
 		if len(queue) == 0 {
 			continue
 		}
 		pullFamily.Metric = append(pullFamily.Metric, queue...)
 	}
-	return &pullFamily
-}
-
-// return a copy of the MetricFamily that can be modified safely
-func (f *familyAndMetrics) copyFamily() dto.MetricFamily {
-	return *f.family
+	return pullFamily
 }
 
 // makeLabeledName builds a unique name from a metric LabelPairs
