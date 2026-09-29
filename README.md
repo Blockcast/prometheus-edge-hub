@@ -28,6 +28,29 @@ scrape_configs:
 
 Pushing metrics to be scraped is as simple as making a post request to the `/metrics` endpoint containing a body with the metrics in [Prometheus Text Exposition Format](https://prometheus.io/docs/instrumenting/exposition_formats/).
 
+## Several scrapers (replicated Prometheus)
+
+By default the hub keeps one buffer and the first scrape drains it. That is right for one Prometheus and wrong for a replicated pair: each replica drains whatever arrived since *any* replica last scraped, so every series is split into disjoint halves and neither replica holds all of it.
+
+Start the hub with `-scrapers` and a positive `-limit` to keep one bounded buffer per scraper instead. Every push is retained once per listed id, and a scrape drains only its own copy, so each replica receives every datapoint exactly once:
+
+```
+prometheus-edge-hub -scrapers=prometheus-0,prometheus-1 -limit=10000
+```
+
+Each scraper names itself on the scrape URL:
+
+```
+scrape_configs:
+  - job_name: 'hub'
+    params:
+      scraper: ['prometheus-0']
+    static_configs:
+      - targets: ['hub:9091']
+```
+
+In this mode an unnamed or unknown scraper gets `400` and drains nothing. A positive `-limit` is required because a permanently stalled replica would otherwise grow its private buffer without bound. A single-buffer hub likewise refuses a scrape that names a scraper, so a mismatch between hub and Prometheus configuration shows up as a failed scrape instead of silently splitting data. `-limit` bounds each scraper's buffer on its own: a scraper that stops scraping drops pushes for itself only (counted in `hub_scraper_rejected_datapoints_total{scraper}`), and a push is refused only when no buffer has room for it. Buffers share the pushed datapoints, so the added memory per scraper is pointers, not copies.
+
 ## Debugging
 
 To see the current state of the hub, make a GET request to `/debug`. This will return stats about the hub, such as how many metrics are stored in it. Use `/debug?verbose` to also see all of the metrics in the format that Prometheus would receive when scraping. Making a request to `/debug` does not remove the metrics from the hub.
@@ -42,6 +65,8 @@ Usage of ./cache.o:
         Port to listen for requests. Default is 9091 (default "9091")
   -scrapeTimeout int
         Timeout for scrape calls. Default is 10 (default 10)
+  -scrapers string
+        Comma-separated scraper ids. When set, every push is kept once per scraper and GET /metrics?scraper=<id> drains only that scraper's copy. When empty, the hub keeps one buffer that the first scrape drains.
 ```
 ## Third-Party Code Disclaimer
 Prometheus Edge Hub contains dependencies which are not maintained by the maintainers of this project. Please read the disclaimer at THIRD_PARTY_CODE_DISCLAIMER.md.

@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 
 	"google.golang.org/grpc"
 
@@ -35,9 +36,20 @@ func main() {
 	scrapeTimeout := flag.Int("scrapeTimeout", defaultScrapeTimeout, fmt.Sprintf("Timeout for scrape calls. Default is %d", defaultScrapeTimeout))
 	grpcPort := flag.Int("grpc-port", defaultGRPCPort, fmt.Sprintf("Port to listen for GRPC requests"))
 	grpcMaxGRPCMsgSizeBytes := flag.Int("grpc-max-msg-size", defaultMaxGRPCMsgSizeBytes, fmt.Sprintf("Max message size (bytes) for GRPC receives"))
+	scrapers := flag.String("scrapers", "", fmt.Sprintf("Comma-separated scraper ids. When set, every push is kept once per scraper and GET /metrics?%s=<id> drains only that scraper's copy, so replicated Prometheus servers scraping one hub each receive every datapoint; -limit then bounds each scraper's buffer. When empty, the hub keeps one buffer that the first scrape drains.", hub.ScraperQueryParam))
 	flag.Parse()
 
 	metricHub := hub.NewMetricHub(*totalMetricsLimit, *scrapeTimeout)
+	if *scrapers != "" {
+		if *totalMetricsLimit <= 0 {
+			log.Fatal("-limit must be positive when -scrapers is set; each scraper buffer needs a finite bound")
+		}
+		perScraper, err := hub.NewPerScraperMetricHub(*totalMetricsLimit, *scrapeTimeout, strings.Split(*scrapers, ","))
+		if err != nil {
+			log.Fatalf("invalid -scrapers %q: %v", *scrapers, err)
+		}
+		metricHub = perScraper
+	}
 	e := echo.New()
 
 	e.POST("/metrics", metricHub.Receive)
