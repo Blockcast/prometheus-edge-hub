@@ -41,6 +41,9 @@ func main() {
 
 	metricHub := hub.NewMetricHub(*totalMetricsLimit, *scrapeTimeout)
 	if *scrapers != "" {
+		if *totalMetricsLimit <= 0 {
+			log.Fatal("-limit must be positive when -scrapers is set; each scraper buffer needs a finite bound")
+		}
 		perScraper, err := hub.NewPerScraperMetricHub(*totalMetricsLimit, *scrapeTimeout, strings.Split(*scrapers, ","))
 		if err != nil {
 			log.Fatalf("invalid -scrapers %q: %v", *scrapers, err)

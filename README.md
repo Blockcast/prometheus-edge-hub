@@ -32,10 +32,10 @@ Pushing metrics to be scraped is as simple as making a post request to the `/met
 
 By default the hub keeps one buffer and the first scrape drains it. That is right for one Prometheus and wrong for a replicated pair: each replica drains whatever arrived since *any* replica last scraped, so every series is split into disjoint halves and neither replica holds all of it.
 
-Start the hub with `-scrapers` to keep one buffer per scraper instead. Every push is retained once per listed id, and a scrape drains only its own copy, so each replica receives every datapoint exactly once:
+Start the hub with `-scrapers` and a positive `-limit` to keep one bounded buffer per scraper instead. Every push is retained once per listed id, and a scrape drains only its own copy, so each replica receives every datapoint exactly once:
 
 ```
-prometheus-edge-hub -scrapers=prometheus-0,prometheus-1
+prometheus-edge-hub -scrapers=prometheus-0,prometheus-1 -limit=10000
 ```
 
 Each scraper names itself on the scrape URL:
@@ -49,7 +49,7 @@ scrape_configs:
       - targets: ['hub:9091']
 ```
 
-In this mode an unnamed or unknown scraper gets `400` and drains nothing. A single-buffer hub likewise refuses a scrape that names a scraper, so a mismatch between hub and Prometheus configuration shows up as a failed scrape instead of silently splitting data. `-limit` bounds each scraper's buffer on its own: a scraper that stops scraping drops pushes for itself only (counted in `hub_scraper_rejected_datapoints_total{scraper}`), and a push is refused only when no buffer has room for it. Buffers share the pushed datapoints, so the added memory per scraper is pointers, not copies.
+In this mode an unnamed or unknown scraper gets `400` and drains nothing. A positive `-limit` is required because a permanently stalled replica would otherwise grow its private buffer without bound. A single-buffer hub likewise refuses a scrape that names a scraper, so a mismatch between hub and Prometheus configuration shows up as a failed scrape instead of silently splitting data. `-limit` bounds each scraper's buffer on its own: a scraper that stops scraping drops pushes for itself only (counted in `hub_scraper_rejected_datapoints_total{scraper}`), and a push is refused only when no buffer has room for it. Buffers share the pushed datapoints, so the added memory per scraper is pointers, not copies.
 
 ## Debugging
 

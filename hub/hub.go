@@ -515,6 +515,29 @@ Current Count Datapoints: %d `, hostname, limitValue, utilizationValue,
 }
 
 func (c *MetricHub) updateCountStats() {
+	c.Lock()
+	defer c.Unlock()
+	if c.perScraper != nil {
+		families := make(map[string]struct{})
+		maxSeries, maxDatapoints := 0, 0
+		for _, buffer := range c.perScraper {
+			seriesInBuffer := 0
+			for name, family := range buffer.metricFamiliesByName {
+				families[name] = struct{}{}
+				seriesInBuffer += len(family.metrics)
+			}
+			if seriesInBuffer > maxSeries {
+				maxSeries = seriesInBuffer
+			}
+			if buffer.datapoints > maxDatapoints {
+				maxDatapoints = buffer.datapoints
+			}
+		}
+		c.stats.currentCountFamilies = len(families)
+		c.stats.currentCountSeries = maxSeries
+		c.stats.currentCountDatapoints = maxDatapoints
+		return
+	}
 	numFamilies := len(c.metricFamiliesByName)
 	numSeries := 0
 	numDatapoints := 0

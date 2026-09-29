@@ -94,6 +94,21 @@ func TestPerScraperHubDeliversGRPCPushesToEveryScraper(t *testing.T) {
 	assert.Equal(t, 20, datapointsIn(t, scrapeAs(t, hub, "b")))
 }
 
+func TestPerScraperHubDebugCountsTheFullestBuffer(t *testing.T) {
+	hub, err := NewPerScraperMetricHub(100, 10, []string{"a", "b"})
+	require.NoError(t, err)
+	_, err = receiveString(hub, sampleReceiveString)
+	require.NoError(t, err)
+	assert.Equal(t, sampleDatapoints, hub.perScraper["a"].datapoints)
+
+	// Drain only one replica; /debug must still report the union of family names
+	// and the fullest remaining buffer rather than the unused shared map.
+	assert.Equal(t, http.StatusOK, scrapeAs(t, hub, "a").Code)
+	hub.updateCountStats()
+	assert.Equal(t, 3, hub.stats.currentCountFamilies)
+	assert.Equal(t, sampleDatapoints, hub.stats.currentCountDatapoints)
+}
+
 // Identical datapoints for each scraper, in the same timestamp order within
 // every series: the buffers share datapoints but must not share queue state.
 // Families are compared by name, because exposeMetrics renders them on a
