@@ -1,6 +1,6 @@
 module github.com/blockcast/prometheus-edge-hub
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/golang/glog v1.2.5
@@ -8,12 +8,12 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.64.0
 	github.com/stretchr/testify v1.11.1
-	google.golang.org/grpc v1.73.0
+	google.golang.org/grpc v1.85.0
 )
 
 require (
-	github.com/labstack/echo/v4 v4.15.4
-	google.golang.org/protobuf v1.36.6
+	github.com/labstack/echo/v4 v4.16.4
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
@@ -30,10 +30,10 @@ require (
 	github.com/rogpeppe/go-internal v1.13.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20250603155806-513f23925822 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260817212433-ac3dfec99bb1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
