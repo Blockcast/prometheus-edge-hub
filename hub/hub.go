@@ -55,12 +55,16 @@ var (
 		Name: "hub_scraper_rejected_datapoints_total",
 		Help: "Datapoints not retained for one scraper in per-scraper mode because its buffer was at the hub limit",
 	}, []string{"scraper"})
+	invalidDatapoints = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "hub_invalid_datapoints_dropped_total",
+		Help: "Pushed datapoints dropped because they repeat a label name; Prometheus would reject the whole scrape that carried them",
+	}, []string{"family"})
 )
 
 func init() {
 	prometheus.MustRegister(hubLimit, hubSize, httpReceiveSizeFam, httpReceiveSizeDP, httpReceiveTime, parseTime,
 		grpcReceiveTime, grpcReceiveSizeDP, grpcReceiveSizeFam, scrapeLockWait,
-		scraperDatapoints, scraperRejectedDatapoints)
+		scraperDatapoints, scraperRejectedDatapoints, invalidDatapoints)
 }
 
 // MetricHub serves as a replacement for the prometheus pushgateway. Accepts
@@ -221,6 +225,7 @@ func (c *MetricHub) Receive(ctx echo.Context) error {
 
 	newDatapoints := 0
 	for _, fam := range parsedFamilies {
+		dropInvalidDatapoints(fam)
 		newDatapoints += len(fam.Metric)
 	}
 
@@ -289,6 +294,7 @@ func (c *MetricHub) ReceiveGRPC(families []*dto.MetricFamily) {
 
 	newDatapoints := 0
 	for _, fam := range families {
+		dropInvalidDatapoints(fam)
 		newDatapoints += len(fam.Metric)
 	}
 
@@ -646,6 +652,34 @@ func (f *familyAndMetrics) popDatapoints() *dto.MetricFamily {
 		pullFamily.Metric = append(pullFamily.Metric, queue...)
 	}
 	return pullFamily
+}
+
+// dropInvalidDatapoints removes datapoints that repeat a label name. gRPC
+// pushes are not validated on the way in, and one such datapoint makes
+// Prometheus reject the entire scrape (`label name "x" is not unique`), so
+// every other series in it would be lost with it (BLO-57226).
+func dropInvalidDatapoints(fam *dto.MetricFamily) {
+	kept := fam.Metric[:0]
+	for _, metric := range fam.Metric {
+		if hasDuplicateLabelName(metric) {
+			glog.Errorf("dropping datapoint of %s: repeated label name in %v", fam.GetName(), metric.GetLabel())
+			invalidDatapoints.WithLabelValues(fam.GetName()).Inc()
+			continue
+		}
+		kept = append(kept, metric)
+	}
+	fam.Metric = kept
+}
+
+func hasDuplicateLabelName(metric *dto.Metric) bool {
+	seen := make(map[string]struct{}, len(metric.GetLabel()))
+	for _, l := range metric.GetLabel() {
+		if _, dup := seen[l.GetName()]; dup {
+			return true
+		}
+		seen[l.GetName()] = struct{}{}
+	}
+	return false
 }
 
 // makeLabeledName builds a unique name from a metric LabelPairs

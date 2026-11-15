@@ -10,6 +10,7 @@ package hub
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/labstack/echo/v4"
@@ -209,4 +210,33 @@ func TestNewPerScraperMetricHubValidatesScraperIDs(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
+}
+
+// BLO-57226: one gRPC-pushed datapoint with a repeated label name must not
+// reach the exposition, or Prometheus rejects the whole scrape with it.
+func TestHubDropsDatapointsWithARepeatedLabelName(t *testing.T) {
+	hub, err := NewPerScraperMetricHub(0, 10, []string{"p0"})
+	require.NoError(t, err)
+	str := func(s string) *string { return &s }
+	ts, v := int64(1000), 1.0
+	pair := func(n, val string) *dto.LabelPair { return &dto.LabelPair{Name: str(n), Value: str(val)} }
+	fam := &dto.MetricFamily{Name: str("cdn_to_server_creation_deferred_total"), Type: dto.MetricType_COUNTER.Enum(), Metric: []*dto.Metric{
+		{Label: []*dto.LabelPair{pair("service", "relay"), pair("service", "cdn")}, Counter: &dto.Counter{Value: &v}, TimestampMs: &ts},
+		{Label: []*dto.LabelPair{pair("exported_service", "relay"), pair("service", "cdn")}, Counter: &dto.Counter{Value: &v}, TimestampMs: &ts},
+	}}
+	before := testutilCounter(t, "cdn_to_server_creation_deferred_total")
+	hub.ReceiveGRPC([]*dto.MetricFamily{fam})
+
+	body := scrapeAs(t, hub, "p0").Body.String()
+	assert.Contains(t, body, `exported_service="relay"`)
+	assert.NotContains(t, body, `{service="relay",service="cdn"}`)
+	assert.Equal(t, 1, strings.Count(body, "cdn_to_server_creation_deferred_total{"))
+	assert.Equal(t, before+1, testutilCounter(t, "cdn_to_server_creation_deferred_total"))
+}
+
+func testutilCounter(t *testing.T, family string) float64 {
+	t.Helper()
+	metric := &dto.Metric{}
+	require.NoError(t, invalidDatapoints.WithLabelValues(family).Write(metric))
+	return metric.GetCounter().GetValue()
 }
